@@ -71,6 +71,8 @@ parser.add_argument('--finetuning', type=int, default=500,
                     help='When (which epochs) to switch to finetuning')
 parser.add_argument('--philly', action='store_true',
                     help='Use philly cluster')
+parser.add_argument("--skip_training", action="store_true", default=False,
+                    help="Load model from --save path and evaluate, without training")
 args = parser.parse_args()
 args.tied = True
 
@@ -250,92 +252,94 @@ def train():
         i += seq_len
 
 
-# Loop over epochs.
-lr = args.lr
-best_val_loss = []
-stored_loss = 100000000
+if not args.skip_training:
+    # Loop over epochs.
+    lr = args.lr
+    best_val_loss = []
+    stored_loss = 100000000
 
-# At any point you can hit Ctrl + C to break out of training early.
-try:
-    optimizer = None
-    # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
-    if args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(params, lr=args.lr, betas=(0, 0.999), eps=1e-9, weight_decay=args.wdecay)
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.5, patience=2, threshold=0)
-    for epoch in range(1, args.epochs + 1):
-        epoch_start_time = time.time()
-        train()
-        if 't0' in optimizer.param_groups[0]:
-            tmp = {}
-            for prm in model.parameters():
-                tmp[prm] = prm.data.clone()
-                prm.data = optimizer.state[prm]['ax'].clone()
+    # At any point you can hit Ctrl + C to break out of training early.
+    try:
+        optimizer = None
+        # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
+        if args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
+        if args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(params, lr=args.lr, betas=(0, 0.999), eps=1e-9, weight_decay=args.wdecay)
+            scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.5, patience=2, threshold=0)
+        for epoch in range(1, args.epochs + 1):
+            epoch_start_time = time.time()
+            train()
+            if 't0' in optimizer.param_groups[0]:
+                tmp = {}
+                for prm in model.parameters():
+                    tmp[prm] = prm.data.clone()
+                    prm.data = optimizer.state[prm]['ax'].clone()
 
-            val_loss2 = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
-            print('-' * 89)
+                val_loss2 = evaluate(val_data, eval_batch_size)
+                print('-' * 89)
+                print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                      'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+                    epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
+                print('-' * 89)
 
-            if val_loss2 < stored_loss:
-                model_save(args.save)
-                print('Saving Averaged!')
-                stored_loss = val_loss2
+                if val_loss2 < stored_loss:
+                    model_save(args.save)
+                    print('Saving Averaged!')
+                    stored_loss = val_loss2
 
-            for prm in model.parameters():
-                prm.data = tmp[prm].clone()
+                for prm in model.parameters():
+                    prm.data = tmp[prm].clone()
 
-            if epoch == args.finetuning:
-                print('Switching to finetuning')
-                optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
-                best_val_loss = []
+                if epoch == args.finetuning:
+                    print('Switching to finetuning')
+                    optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+                    best_val_loss = []
 
-            if epoch > args.finetuning and len(best_val_loss) > args.nonmono and val_loss2 > min(
-                    best_val_loss[:-args.nonmono]):
-                print('Done!')
-                import sys
+                if epoch > args.finetuning and len(best_val_loss) > args.nonmono and val_loss2 > min(
+                        best_val_loss[:-args.nonmono]):
+                    print('Done!')
+                    import sys
 
-                sys.exit(1)
+                    sys.exit(1)
 
-        else:
-            val_loss = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                  'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
-            print('-' * 89)
+            else:
+                val_loss = evaluate(val_data, eval_batch_size)
+                print('-' * 89)
+                print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                      'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+                    epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
+                print('-' * 89)
 
-            if val_loss < stored_loss:
-                model_save(args.save)
-                print('Saving model (new best validation)')
-                stored_loss = val_loss
+                if val_loss < stored_loss:
+                    model_save(args.save)
+                    print('Saving model (new best validation)')
+                    stored_loss = val_loss
 
-            if args.optimizer == 'adam':
-                scheduler.step(val_loss)
+                if args.optimizer == 'adam':
+                    scheduler.step(val_loss)
 
-            if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (
-                    len(best_val_loss) > args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
-                print('Switching to ASGD')
-                optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+                if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (
+                        len(best_val_loss) > args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
+                    print('Switching to ASGD')
+                    optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
 
-            if epoch in args.when:
-                print('Saving model before learning rate decreased')
-                model_save('{}.e{}'.format(args.save, epoch))
-                print('Dividing learning rate by 10')
-                optimizer.param_groups[0]['lr'] /= 10.
+                if epoch in args.when:
+                    print('Saving model before learning rate decreased')
+                    model_save('{}.e{}'.format(args.save, epoch))
+                    print('Dividing learning rate by 10')
+                    optimizer.param_groups[0]['lr'] /= 10.
 
-            best_val_loss.append(val_loss)
+                best_val_loss.append(val_loss)
 
-        print("PROGRESS: {}%".format((epoch / args.epochs) * 100))
+            print("PROGRESS: {}%".format((epoch / args.epochs) * 100))
 
-except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+    except KeyboardInterrupt:
+        print('-' * 89)
+        print('Exiting from training early')
 
 # Load the best saved model.
+print("Loading model from", args.save)
 model_load(args.save)
 
 # Run on test data.
