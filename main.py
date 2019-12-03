@@ -104,11 +104,11 @@ def model_save(fn):
 
 
 def model_load(fn):
-    global model, criterion, optimizer
+    global model, optimizer
     if args.philly:
         fn = os.path.join(os.environ['PT_OUTPUT_DIR'], fn)
     with open(fn, 'rb') as f:
-        model, criterion, optimizer = torch.load(f)
+        model, _, optimizer = torch.load(f)
 
 
 import os
