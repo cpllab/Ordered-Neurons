@@ -49,6 +49,9 @@ parser.add_argument('--xent_mode', choices=['splitcross', 'default'],
                     default='default',
                     help=('Method for evaluating cross-entropy loss. `default` refers to pytorch '
                           'builtin, and `splitcross` refers to an approximate softmax eval.'))
+parser.add_argument('--eval_xent_whitelist',
+                    help=('File with one vocab word per line. Word types not in this list will be '
+                          'excluded in model evaluation.'))
 
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
@@ -125,11 +128,32 @@ else:
     corpus = data.Corpus(args.data)
     torch.save(corpus, fn)
 
+val_mask, test_mask = None, None
+if args.eval_xent_whitelist is not None:
+    if args.xent_mode != "default":
+        raise ValueError("Xent whitelisting is only supported with --xent_mode=default")
+
+    print("Re-processing val and test data with xent whitelist at %s" % args.eval_xent_whitelist)
+    with open(args.eval_xent_whitelist, "r") as whitelist_f:
+        xent_whitelist = [line.strip() for line in whitelist_f if line.strip()]
+
+    val_mask = corpus.get_mask(corpus.valid, xent_whitelist)
+    test_mask = corpus.get_mask(corpus.test, xent_whitelist)
+
+    print("%% tokens masked in valid: %.02f%%, test: %.02f%%" %
+            (100 - val_mask.float().mean() * 100., 100 - test_mask.float().mean() * 100.))
+
+
+# Batchify.
 eval_batch_size = 10
 test_batch_size = 1
 train_data = batchify(corpus.train, args.batch_size, args)
 val_data = batchify(corpus.valid, eval_batch_size, args)
 test_data = batchify(corpus.test, test_batch_size, args)
+
+if val_mask is not None:
+    val_mask = batchify(val_mask, eval_batch_size, args)
+    test_mask = batchify(test_mask, test_batch_size, args)
 
 ###############################################################################
 # Build the model
@@ -165,7 +189,9 @@ if args.xent_mode == "splitcross":
     print('Using', splits)
     criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
 elif args.xent_mode == "default":
-    criterion = nn.CrossEntropyLoss()
+    # If whitelisting, we need to do per-token masking ==> skip auto-reducing over tokens.
+    reduction = "none" if args.eval_xent_whitelist is not None else "elementwise_mean"
+    criterion = nn.CrossEntropyLoss(reduction=reduction)
 else:
     raise ValueError("unknown --xent_mode %s" % args.xent_mode)
 
@@ -184,15 +210,23 @@ print('Model total parameters:', total_params)
 # Training code
 ###############################################################################
 
-def evaluate(data_source, batch_size=10):
+def evaluate(data_source, mask_source=None, batch_size=10):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     if args.model == 'QRNN': model.reset()
     total_loss = 0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
+
+    # pre-cast mask vector to float.
+    if mask_source is not None:
+        assert data_source.size(0) == mask_source.size(0)
+        mask_source = mask_source.float()
+
     for i in trange(0, data_source.size(0) - 1, args.bptt):
-        data, targets = get_batch(data_source, i, args, evaluation=True)
+        data, targets, mask = get_batch(data_source, i, args,
+                                        mask_source=mask_source, evaluation=True)
+
         output, hidden = model(data, hidden)
 
         if isinstance(criterion, SplitCrossEntropyLoss):
@@ -200,7 +234,12 @@ def evaluate(data_source, batch_size=10):
             batch_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets).data
         else:
             logits = model.decoder(output)
-            batch_loss = criterion(logits, targets).data
+            batch_loss = criterion(logits, targets)
+
+            if mask is not None:
+                batch_loss *= mask
+
+            batch_loss = batch_loss.mean().data
 
         total_loss += len(data) * batch_loss
         hidden = repackage_hidden(hidden)
@@ -225,7 +264,7 @@ def train():
         lr2 = optimizer.param_groups[0]['lr']
         optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
         model.train()
-        data, targets = get_batch(train_data, i, args, seq_len=seq_len)
+        data, targets, _ = get_batch(train_data, i, args, seq_len=seq_len)
 
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
@@ -362,7 +401,7 @@ print("Loading model from", args.save)
 model_load(args.save)
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
+test_loss = evaluate(test_data, mask_source=test_mask, batch_size=test_batch_size)
 print('=' * 89)
 print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
     test_loss, math.exp(test_loss), test_loss / math.log(2)))

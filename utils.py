@@ -22,11 +22,14 @@ def batchify(data, bsz, args):
     return data
 
 
-def get_batch(source, i, args, seq_len=None, evaluation=False):
+def get_batch(source, i, args, mask_source=None, seq_len=None, evaluation=False):
     seq_len = min(seq_len if seq_len else args.bptt, len(source) - 1 - i)
     data = source[i:i+seq_len]
     target = source[i+1:i+1+seq_len].view(-1)
-    return data, target
+    if mask_source is not None:
+        mask = mask_source[i+1:i+1+seq_len].view(-1)
+        return data, target, mask
+    return data, target, None
 
 
 def load_embeddings_txt(path):
