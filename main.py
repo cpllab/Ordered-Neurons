@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim.lr_scheduler as lr_scheduler
+from tqdm import tqdm, trange
 
 import data
 import model
@@ -44,6 +45,11 @@ parser.add_argument('--dropoute', type=float, default=0.1,
                     help='dropout to remove words from embedding layer (0 = no dropout)')
 parser.add_argument('--wdrop', type=float, default=0.4,
                     help='amount of weight dropout to apply to the RNN hidden to hidden matrix')
+parser.add_argument('--xent_mode', choices=['splitcross', 'default'],
+                    default='default',
+                    help=('Method for evaluating cross-entropy loss. `default` refers to pytorch '
+                          'builtin, and `splitcross` refers to an approximate softmax eval.'))
+
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--nonmono', type=int, default=5,
@@ -146,7 +152,7 @@ if args.resume:
         for rnn in model.rnn.cells:
             rnn.hh.dropout = args.wdrop
 ###
-if not criterion:
+if args.xent_mode == "splitcross":
     splits = []
     if ntokens > 500000:
         # One Billion
@@ -158,6 +164,11 @@ if not criterion:
         splits = [2800, 20000, 76000]
     print('Using', splits)
     criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+elif args.xent_mode == "default":
+    criterion = nn.CrossEntropyLoss()
+else:
+    raise ValueError("unknown --xent_mode %s" % args.xent_mode)
+
 ###
 if args.cuda:
     model = model.cuda()
@@ -180,10 +191,18 @@ def evaluate(data_source, batch_size=10):
     total_loss = 0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
+    for i in trange(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, args, evaluation=True)
         output, hidden = model(data, hidden)
-        total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets).data
+
+        if isinstance(criterion, SplitCrossEntropyLoss):
+            # SplitCrossEntropyLoss manages logits matmul on its own.
+            batch_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets).data
+        else:
+            logits = model.decoder(output)
+            batch_loss = criterion(logits, targets).data
+
+        total_loss += len(data) * batch_loss
         hidden = repackage_hidden(hidden)
     return total_loss.item() / len(data_source)
 
